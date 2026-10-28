@@ -26,6 +26,8 @@ class Config:
     examples_dir: Path = BASE_DIR / "data" / "examples"
     examples_per_request: int = int(os.getenv("EXAMPLES_PER_REQUEST", "3"))
 
+    ig_username: str = os.getenv("IG_USERNAME", "")
+    ig_password: str = os.getenv("IG_PASSWORD", "")
     ig_sessionid: str = os.getenv("IG_SESSIONID", "")
     ig_proxy: str = os.getenv("IG_PROXY", "")
     ig_settings: Path = BASE_DIR / "data" / "ig_session.json"

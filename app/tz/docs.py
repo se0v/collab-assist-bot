@@ -1,10 +1,13 @@
 import io
 import re
+import ssl
 
 import aiohttp
+import certifi
 from docx import Document
 
 GDOC = re.compile(r"https?://docs\.google\.com/document/d/([\w-]{20,})")
+SSL_CONTEXT = ssl.create_default_context(cafile=certifi.where())
 
 
 class DocDownloadError(Exception):
@@ -34,7 +37,8 @@ def gdoc_ids(text: str) -> list[str]:
 
 async def download_gdoc(doc_id: str) -> bytes:
     url = f"https://docs.google.com/document/d/{doc_id}/export?format=docx"
-    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
+    connector = aiohttp.TCPConnector(ssl=SSL_CONTEXT)
+    async with aiohttp.ClientSession(connector=connector, timeout=aiohttp.ClientTimeout(total=30)) as session:
         async with session.get(url) as resp:
             data = await resp.read()
             ctype = resp.headers.get("Content-Type", "")

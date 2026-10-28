@@ -7,6 +7,7 @@ from aiogram.enums import ParseMode
 from aiogram.types import BotCommand
 
 from app.config import config
+from app.handlers_search import router as search_router
 from app.handlers_tz import router as tz_router
 
 
@@ -17,6 +18,7 @@ async def main():
 
     bot = Bot(config.bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher()
+    dp.include_router(search_router)
     dp.include_router(tz_router)
 
     await bot.set_my_commands([
