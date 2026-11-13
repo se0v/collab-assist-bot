@@ -33,5 +33,11 @@ class Config:
     ig_settings: Path = BASE_DIR / "data" / "ig_session.json"
     search_max_checks: int = int(os.getenv("SEARCH_MAX_CHECKS", "80"))
 
+    ref_search: bool = os.getenv("REF_SEARCH", "1") == "1"
+    ref_min_views: int = int(os.getenv("REF_MIN_VIEWS", "5000"))
+    ref_count: int = int(os.getenv("REF_COUNT", "6"))
+    ref_from_examples: bool = os.getenv("REF_FROM_EXAMPLES", "0") == "1"
+    ref_tail: bool = os.getenv("REF_TAIL", "1") == "1"
+
 
 config = Config()

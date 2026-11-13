@@ -1,10 +1,13 @@
 import json
+import logging
 import re
 
 from openai import AsyncOpenAI
 
 from .examples import Example
 from .model import TZ
+
+log = logging.getLogger(__name__)
 
 URL = re.compile(r"https?://\S+")
 JSON_BLOCK = re.compile(r"\{.*\}", re.S)
@@ -16,6 +19,8 @@ SYSTEM = """Ты маркетолог бренда и пишешь технич�
 {
   "brand": "бренд, если он есть в запросе, иначе пустая строка",
   "product": "название товара в именительном падеже, с большой буквы",
+  "references_queries": ["2-3 коротких поисковых запроса для поиска рилсов-референсов"],
+  "references_tags": ["2-3 хештега без решетки для поиска рилсов-референсов"],
   "theses_intro": "указание блогеру от бренда: легенда подачи и что обязательно проговорить, 2-3 предложения",
   "theses": ["5-7 коротких тезисов, каждый одной строкой, без точки в конце"]
 }
@@ -34,6 +39,8 @@ SYSTEM = """Ты маркетолог бренда и пишешь технич�
 - Если в запросе есть детали о товаре (особенности, цена, промокод), обязательно используй их.
 - Не придумывай конкретные цифры, технологии и характеристики, которых нет в запросе или в примерах.
 - Самое важное в 1-2 местах выдели так: ==текст==.
+- references_queries - то, что человек вбил бы в поиск Instagram, чтобы найти живые ролики с таким товаром: товар и тип ролика, например "триммер женский обзор", "распаковка триммер". Без названия бренда и без слова "реклама".
+- references_tags - популярные хештеги по товару на русском, одним словом без пробелов, например "триммер", "женскийтриммер".
 - Если запрос вообще не про товар, верни {"product": ""}."""
 
 STYLE_HINT = """Ниже реальные ТЗ бренда. Пиши новое ТЗ в их стиле: такой же длины, теми же простыми формулировками, с такой же подачей.
@@ -52,6 +59,13 @@ DEFAULT_EXAMPLE = """Товар: Набор для ухода
 DETECT = """Тебе прислали техническое задание для блогеров. Определи, для какого товара оно написано.
 Верни только JSON: {"product": "название товара в именительном падеже, 1-3 слова"}"""
 
+REF_PICK = """Бренд готовит ТЗ блогеру на рекламу товара "{product}". Рилс-референс показывает блогеру, как можно подать этот товар.
+Поисковые запросы: {query}
+
+Кандидаты из поиска Instagram будут ниже списком.
+
+Выбери до {k} номеров, которые подходят лучше всего: именно этот товар или похожий сценарий, живая подача, нормальные просмотры. Не выбирай ролики, где товар не показан. Отсортируй по релевантности.
+Верни только JSON: {{"picked": [номера через запятую]}}"""
 
 GREETING = re.compile(
     r"^\s*(всем\s+привет|привет|приветик|здравствуите|здравствуи|добрыи\s+(день|вечер|утро)|хеи|друзья|девочки|ребята|дорогие\s+\w+)"
@@ -78,6 +92,22 @@ def strip_greeting(text: str) -> str:
 
 def clean_thesis(text: str) -> str:
     return strip_greeting(str(text).strip().lstrip("-•* ").rstrip(". "))
+
+
+def clean_list(value, limit: int) -> list[str]:
+    if isinstance(value, str):
+        value = [value]
+    result = []
+    for item in value or []:
+        text = re.sub(r"\s+", " ", str(item).replace("#", " ")).strip()
+        if text and text.lower() not in (r.lower() for r in result):
+            result.append(text)
+    return result[:limit]
+
+
+def clean_tags(value) -> list[str]:
+    tags = [re.sub(r"[^\w]", "", t.lower()) for t in clean_list(value, 6)]
+    return [t for t in dict.fromkeys(tags) if 2 <= len(t) <= 30][:3]
 
 
 def build_prompt(text: str, examples: list[Example]) -> str:
@@ -120,6 +150,19 @@ class Generator:
             return "Без названия"
         return str(data.get("product") or "").strip() or "Без названия"
 
+    async def pick_refs(self, product: str, query: str, candidates: list[str], k: int) -> list[int]:
+        try:
+            text = REF_PICK.format(product=product, query=query, k=k) + "\n\n" + "\n".join(candidates)
+            data = await self._ask_twice("Ты помогаешь подобрать рилсы-референсы для ТЗ блогеру.", text, max_tokens=150)
+        except Exception:
+            log.warning("pick_refs failed", exc_info=True)
+            return []
+        result = []
+        for value in data.get("picked") or []:
+            if isinstance(value, int) and 1 <= value <= len(candidates) and value - 1 not in result:
+                result.append(value - 1)
+        return result
+
     async def generate(self, text: str, examples: list[Example] | None = None) -> TZ:
         data = await self._ask_twice(SYSTEM, build_prompt(text, examples or []))
 
@@ -132,6 +175,8 @@ class Generator:
         return TZ(
             brand=str(data.get("brand") or "").strip(),
             product=product,
+            references_queries=clean_list(data.get("references_queries"), 3),
+            references_tags=clean_tags(data.get("references_tags")),
             theses_intro=strip_greeting(str(data.get("theses_intro") or "").strip()),
             theses=theses,
             references=URL.findall(text),

@@ -15,9 +15,15 @@ from instagrapi.exceptions import (
     RateLimitError,
 )
 
+from ..links import clean_url, code_from_pk
+
 log = logging.getLogger(__name__)
 
 BLOCKING_ERRORS = (LoginRequired, ChallengeRequired, FeedbackRequired, PleaseWaitFewMinutes, RateLimitError)
+
+CODE = re.compile(r"^[A-Za-z0-9_-]{5,20}$")
+VIEW_KEYS = ("play_count", "view_count", "ig_play_count", "video_view_count")
+MEDIA_KEYS = ("pk", "id", "media_type", "product_type", "taken_at", "play_count", "video_versions", "clips_metadata")
 
 
 def collect_users(node, found: dict[str, str]):
@@ -32,8 +38,10 @@ def collect_users(node, found: dict[str, str]):
         for value in node:
             collect_users(value, found)
 
+
 def no_challenge(username, choice):
     raise ChallengeRequired(message="challenge_required")
+
 
 @dataclass
 class Profile:
@@ -55,6 +63,59 @@ class Profile:
     @property
     def url(self) -> str:
         return f"https://www.instagram.com/{self.username}/"
+
+
+@dataclass
+class Reel:
+    code: str
+    views: int = 0
+    author: str = ""
+    caption: str = ""
+
+    @property
+    def url(self) -> str:
+        return clean_url(self.code)
+
+
+def to_int(value) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def media_code(node: dict) -> str:
+    code = node.get("code")
+    if isinstance(code, str) and CODE.match(code):
+        return code
+    if node.get("media_type") is None and node.get("product_type") is None:
+        return ""
+    pk = str(node.get("pk") or node.get("id") or "").split("_")[0]
+    if pk.isdigit() and len(pk) >= 15:
+        return code_from_pk(pk)
+    return ""
+
+
+def collect_media(node, found: dict[str, Reel]):
+    if isinstance(node, dict):
+        code = media_code(node)
+        is_media = code and any(key in node for key in MEDIA_KEYS)
+        if is_media and node.get("media_type") not in (1, 8):
+            user = node.get("user")
+            caption = node.get("caption")
+            if isinstance(caption, dict):
+                caption = caption.get("text")
+            found.setdefault(code, Reel(
+                code=code,
+                views=max(to_int(node.get(key)) for key in VIEW_KEYS),
+                author=str(user.get("username") or "") if isinstance(user, dict) else "",
+                caption=str(caption or "").replace("\n", " "),
+            ))
+        for value in node.values():
+            collect_media(value, found)
+    elif isinstance(node, list):
+        for value in node:
+            collect_media(value, found)
 
 
 class Instagram:
@@ -94,8 +155,10 @@ class Instagram:
         cl.set_timezone_offset(3 * 3600)
         if self.username and self.password:
             cl.login(self.username, self.password)
-        else:
+        elif self.sessionid:
             cl.login_by_sessionid(self.sessionid)
+        elif not cl.user_id:
+            raise LoginRequired(message="login_required")
         self.settings_path.parent.mkdir(parents=True, exist_ok=True)
         cl.dump_settings(self.settings_path)
         self.client = cl
@@ -103,6 +166,11 @@ class Instagram:
 
     def reset(self):
         self.client = None
+
+    def _dump(self, source: str, payload):
+        self.debug_dir.mkdir(parents=True, exist_ok=True)
+        name = re.sub(r"[^\w-]+", "_", source)[:80]
+        (self.debug_dir / f"{name}.json").write_text(json.dumps(payload, ensure_ascii=False, indent=1), encoding="utf-8")
 
     def related_tags(self, term: str, top: int = 3) -> list[str]:
         if term.startswith("#"):
@@ -138,9 +206,7 @@ class Instagram:
         users.pop(str(cl.user_id), None)
         log.info("%s: %d authors", source, len(users))
         if not users:
-            self.debug_dir.mkdir(parents=True, exist_ok=True)
-            name = re.sub(r"[^\w-]+", "_", source)[:80]
-            (self.debug_dir / f"{name}.json").write_text(json.dumps(payload, ensure_ascii=False, indent=1), encoding="utf-8")
+            self._dump(source, payload)
         return list(users.items())
 
     def reels_authors(self, query: str) -> list[tuple[str, str]]:
@@ -198,3 +264,88 @@ class Instagram:
         dates = [c.taken_at for c in clips if c.taken_at]
         p.last_post = max(dates) if dates else None
         return p
+
+    def _reels_request(self, source: str, endpoint: str, **kwargs) -> list[Reel]:
+        cl = self.connect()
+        try:
+            payload = cl.private_request(endpoint, **kwargs)
+        except BLOCKING_ERRORS:
+            raise
+        except Exception:
+            log.warning("%s failed", source, exc_info=True)
+            return []
+        found: dict[str, Reel] = {}
+        collect_media(payload, found)
+        reels = list(found.values())
+        log.info("%s: %d reels, %d with views", source, len(reels), sum(1 for r in reels if r.views))
+        if not reels:
+            self._dump(f"refs {source}", payload)
+        return reels
+
+    def reels_search(self, query: str) -> list[Reel]:
+        cl = self.connect()
+        params = {"search_surface": "clips_search_page", "timezone_offset": cl.timezone_offset, "query": query}
+        return self._reels_request(f"reels {query}", "fbsearch/reels_serp/", params=params)
+
+    def tag_reels(self, tag: str) -> list[Reel]:
+        cl = self.connect()
+        data = {
+            "tab": "clips",
+            "media_recency_filter": "clips",
+            "_uuid": cl.uuid,
+            "include_persistent": "false",
+            "rank_token": cl.rank_token,
+        }
+        reels = self._reels_request(f"tag {tag}", f"tags/{tag}/sections/", data=data, with_signature=False)
+        if reels:
+            return reels
+        try:
+            medias = cl.hashtag_medias_reels_v1(tag, amount=30)
+        except BLOCKING_ERRORS:
+            raise
+        except Exception:
+            log.warning("tag %s fallback failed", tag, exc_info=True)
+            return []
+        reels = [
+            Reel(
+                code=m.code,
+                views=to_int(m.play_count or m.view_count),
+                author=m.user.username if m.user else "",
+                caption=(m.caption_text or "").replace("\n", " "),
+            )
+            for m in medias
+            if m.code
+        ]
+        log.info("tag %s fallback: %d reels", tag, len(reels))
+        return reels
+
+    def account_reels(self, query: str, accounts: int = 6, per_account: int = 8) -> list[Reel]:
+        authors = self.account_authors(query)
+        if not authors:
+            return []
+        cl = self.connect()
+        reels: dict[str, Reel] = {}
+        for pk, username in authors[:accounts]:
+            try:
+                medias, _ = cl.user_medias_paginated_v1(pk, amount=per_account * 2)
+            except BLOCKING_ERRORS:
+                raise
+            except Exception:
+                log.warning("medias for %s failed", username, exc_info=True)
+                continue
+            for m in medias:
+                if not m.code:
+                    continue
+                is_clip = m.product_type == "clips" or (m.media_type == 2 and (m.play_count or m.view_count))
+                if not is_clip:
+                    continue
+                reels.setdefault(m.code, Reel(
+                    code=m.code,
+                    views=to_int(m.play_count or m.view_count),
+                    author=username,
+                    caption=(m.caption_text or "").replace("\n", " "),
+                ))
+            if len(reels) >= accounts * per_account:
+                break
+        log.info("account_reels %s: %d reels from %d accounts", query, len(reels), min(accounts, len(authors)))
+        return list(reels.values())

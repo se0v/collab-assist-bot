@@ -16,6 +16,8 @@ class TZ:
     theses: list[str] = field(default_factory=list)
     examples_note: str = ""
     references: list[str] = field(default_factory=list)
+    references_queries: list[str] = field(default_factory=list)
+    references_tags: list[str] = field(default_factory=list)
 
 
 def load_defaults() -> dict:

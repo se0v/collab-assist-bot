@@ -4,10 +4,13 @@ import re
 from datetime import datetime
 
 from aiogram import F, Router
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.types import BufferedInputFile, Message
 
 from .config import config
+from .ig_client import ig, ig_lock
+from .links import reel_codes
 from .tz import (
     TZ,
     DocDownloadError,
@@ -17,6 +20,7 @@ from .tz import (
     apply_defaults,
     docx_to_text,
     download_gdoc,
+    find_references,
     gdoc_ids,
     render,
 )
@@ -30,7 +34,9 @@ HELP = """Напишите, для какого товара нужно ТЗ, н
 <code>ТЗ по выпрямителю</code>
 <code>нужно ТЗ на фен Cosmolex, 3 насадки, ионизация, промокод HAIR10</code>
 
-Чем больше деталей о товаре, тем точнее тезисы. Ссылки на референсы можно добавить в то же сообщение.
+Чем больше деталей о товаре, тем точнее тезисы.
+
+Референсы бот ищет сам: подбирает рилсы в Instagram под товар. Свои ссылки на рилсы можно добавить в то же сообщение, тогда бот использует только их.
 
 База примеров: пришлите готовые ТЗ файлами .docx или ссылками на Google Документы (с доступом по ссылке). Бот будет писать новые ТЗ в их стиле.
 /examples - список примеров, /delete 3 - удалить пример №3 (неактуальные примеры ТЗ важно удалять)
@@ -52,13 +58,13 @@ def make_filename(tz: TZ) -> str:
     return "_".join(clean) + ".docx"
 
 
-async def add_example(data: bytes) -> str | None:
+async def add_example(data: bytes) -> tuple[str, int] | None:
     text = await asyncio.to_thread(docx_to_text, data)
     if len(text) < 50:
         return None
     product = await generator.detect_product(text)
     store.add(product, text)
-    return product
+    return product, len(reel_codes(text))
 
 
 @router.message(CommandStart())
@@ -81,7 +87,10 @@ async def cmd_examples(message: Message):
     if not items:
         await message.answer("База примеров пуста. Пришлите ТЗ файлом .docx или ссылкой на Google Документ")
         return
-    lines = [f"{i}. <b>{e.product}</b> - {e.text[:60].replace(chr(10), ' ')}..." for i, e in enumerate(items, start=1)]
+    lines = [
+        f"{i}. <b>{e.product}</b> - рилсов: {len(reel_codes(e.text))}, {e.text[:50].replace(chr(10), ' ')}..."
+        for i, e in enumerate(items, start=1)
+    ]
     await message.answer("Примеры ТЗ:\n" + "\n".join(lines)[:3900])
 
 
@@ -109,15 +118,16 @@ async def on_document(message: Message):
         return
     try:
         file = await message.bot.download(message.document)
-        product = await add_example(file.read())
+        added = await add_example(file.read())
     except Exception:
         log.exception("failed to add example %s", name)
         await message.answer(f"Не получилось прочитать {name}")
         return
-    if product is None:
+    if added is None:
         await message.answer(f"В файле {name} почти нет текста, пропускаю")
     else:
-        await message.answer(f"Добавил пример: <b>{product}</b> ({name})")
+        product, links = added
+        await message.answer(f"Добавил пример: <b>{product}</b> ({name}), ссылок на рилсы: {links}")
 
 
 @router.message(F.text | F.caption)
@@ -143,7 +153,7 @@ async def import_gdocs(message: Message, ids: list[str]):
     added, failed = [], 0
     for doc_id in ids:
         try:
-            product = await add_example(await download_gdoc(doc_id))
+            result = await add_example(await download_gdoc(doc_id))
         except DocDownloadError:
             failed += 1
             continue
@@ -151,8 +161,8 @@ async def import_gdocs(message: Message, ids: list[str]):
             log.exception("failed to import gdoc %s", doc_id)
             failed += 1
             continue
-        if product:
-            added.append(product)
+        if result:
+            added.append(f"{result[0]} (рилсов: {result[1]})")
         else:
             failed += 1
     lines = [f"Добавлено примеров: {len(added)}"] + [f"- {p}" for p in added]
@@ -176,11 +186,30 @@ async def process_later(message: Message, uid: int):
         return
 
     status = await message.answer("Пишу ТЗ..")
+
+    async def progress(t: str):
+        try:
+            await status.edit_text(t)
+        except TelegramBadRequest:
+            pass
+
     try:
         examples = store.pick(text, config.examples_per_request)
         tz = apply_defaults(await generator.generate(text, examples), config.default_brand)
+        caption = ""
+        if not tz.references and config.ref_search:
+            try:
+                refs = await find_references(
+                    ig, ig_lock, generator, store, tz, progress,
+                    config.ref_min_views, config.ref_count, config.ref_tail, config.ref_from_examples,
+                )
+                tz.references = refs.urls
+                caption = refs.summary()
+            except Exception:
+                log.exception("references failed")
+                caption = "Референсы не добавились из-за ошибки, подробности в логе."
         data = await asyncio.to_thread(render, tz)
-        await message.answer_document(BufferedInputFile(data, filename=make_filename(tz)))
+        await message.answer_document(BufferedInputFile(data, filename=make_filename(tz)), caption=caption or None)
         await status.delete()
     except NotAProduct:
         await status.edit_text("Не понял, для какого товара нужно ТЗ. Пример: <code>ТЗ по выпрямителю</code>")

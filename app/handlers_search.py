@@ -9,14 +9,11 @@ from aiogram.types import BufferedInputFile, Message
 
 from .config import config
 from .handlers_tz import is_allowed
-from .search import Instagram, SearchStopped, build_top_message, build_xlsx, parse_query, run_search
+from .ig_client import ig, ig_lock
+from .search import SearchStopped, build_top_message, build_xlsx, parse_query, run_search
 
 log = logging.getLogger(__name__)
 router = Router()
-
-ig_ready = (config.ig_username and config.ig_password) or config.ig_sessionid
-ig = Instagram(config.ig_settings, config.ig_username, config.ig_password, config.ig_sessionid, config.ig_proxy) if ig_ready else None
-lock = asyncio.Lock()
 
 HELP = """Поиск блогеров по нише.
 
@@ -49,11 +46,11 @@ async def cmd_search(message: Message, command: CommandObject):
     if not query.terms:
         await message.answer(HELP)
         return
-    if lock.locked():
-        await message.answer("Уже идет другой поиск, дождитесь его окончания")
+    if ig_lock.locked():
+        await message.answer("Instagram сейчас занят другим поиском, дождитесь его окончания")
         return
 
-    async with lock:
+    async with ig_lock:
         status = await message.answer("Запускаю поиск..")
 
         async def progress(text: str):
